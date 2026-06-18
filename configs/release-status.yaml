@@ -1,0 +1,37 @@
+# Release Status Tracking
+# Example structure when populated:
+# current_release:
+#   version: "v3.5.0"
+#   status: "awaiting_validation"  # Status values:
+#     #   scheduled - release is planned but not yet triggered
+#     #   awaiting_validation - staging complete, awaiting validation approval
+#     #   in_progress_community_release - validation approved, community PR in progress
+#     #   completed - community PR merged, release published
+#     #   failed - error occurred, requires manual intervention
+#   created_at: "2026-05-20T10:30:00Z"
+#   created_by: "github-username"  # github.actor who triggered the release
+#   external_run_url: "https://github.com/..."
+#   # Release Validation fields
+#   release_validation:
+#     validated_by: null        # github.actor who runs release validation workflow
+#     validated_at: null        # timestamp of release validation
+#   # Community Release fields
+#   community_release:
+#     triggered_at: null         # when community release was triggered
+#     pr_url: null               # URL to community-operators-prod PR
+#     pr_merged: false           # whether community PR was merged
+#   completed_at: null           # when release fully completed
+#   error_message: null          # error details if status = failed
+
+current_release: null
+
+# Next planned release information
+next_release:
+  enabled: false
+  version: null
+  release_date: null
+  code_freeze_date: null
+  last_updated: null
+  updated_by: null
+
+release_history: []

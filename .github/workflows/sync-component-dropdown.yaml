@@ -1,0 +1,52 @@
+name: Sync Component Dropdown
+
+on:
+  push:
+    paths:
+      - "configs/components-registry.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read  # Default permissions, elevated access via GitHub App token
+
+jobs:
+  sync-dropdown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token for ODH_RELEASE_BOT
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ODH_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.ODH_RELEASE_BOT_PRIVATE_KEY }}
+          owner: opendatahub-io
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.generate-token.outputs.token }}  # Use GitHub App token
+
+      - name: Update register-component workflow
+        run: |
+          WORKFLOW_FILE=".github/workflows/register-component.yaml"
+
+          # Extract component names as a JSON array for yq
+          COMPONENTS_JSON=$(yq e '.components[].name' configs/components-registry.yaml | jq -R . | jq -s .)
+
+          echo "Updating dropdown options with components:"
+          echo "$COMPONENTS_JSON" | jq -r '.[]'
+
+          # Update the workflow file using yq to replace the options array
+          yq e ".on.workflow_dispatch.inputs.component_name.options = $COMPONENTS_JSON" -i "$WORKFLOW_FILE"
+
+          echo "Updated register-component.yaml with current component list"
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+        with:
+          commit_message: "chore: sync component dropdown with registry [skip-checks:true]"
+          file_pattern: ".github/workflows/register-component.yaml"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"

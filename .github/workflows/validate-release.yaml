@@ -1,0 +1,160 @@
+name: Release Validation and Community Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read # Default permissions, elevated access via GitHub App token
+
+jobs:
+  validate-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token for ODH_RELEASE_BOT
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ODH_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.ODH_RELEASE_BOT_PRIVATE_KEY }}
+          owner: opendatahub-io
+          repositories: >-
+            odh-release-manager,
+            opendatahub-operator
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.generate-token.outputs.token }} # Use GitHub App token
+
+      - name: Validate release status for validation approval
+        id: validate
+        run: |
+          CURRENT_STATUS=$(yq e '.current_release.status // "null"' configs/release-status.yaml)
+          CURRENT_VERSION=$(yq e '.current_release.version // "null"' configs/release-status.yaml)
+
+          echo "Current release version: $CURRENT_VERSION"
+          echo "Current release status: $CURRENT_STATUS"
+
+          if [ "$CURRENT_VERSION" == "null" ] || [ -z "$CURRENT_VERSION" ]; then
+            echo "::error::No current release found"
+            echo "::error::Please trigger a release first"
+            exit 1
+          fi
+
+          if [ "$CURRENT_STATUS" != "awaiting_validation" ]; then
+            echo "::error::Current release status: $CURRENT_STATUS. Must be 'awaiting_validation'"
+            echo "::error::Release must be triggered and reach awaiting_validation status before validation can be approved"
+            exit 1
+          fi
+
+          echo "release_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Validation passed - ready for release validation on $CURRENT_VERSION"
+
+      - name: Record release validation approval
+        run: |
+          RELEASE_VERSION="${{ steps.validate.outputs.release_version }}"
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          VALIDATOR="${{ github.actor }}"
+
+          echo "Recording release validation approval for $RELEASE_VERSION:"
+          echo "  Validator: $VALIDATOR"
+          echo "  Timestamp: $TIMESTAMP"
+
+          # Update release validation fields in release status
+          yq e "
+            .current_release.release_validation.validated_by = \"$VALIDATOR\" |
+            .current_release.release_validation.validated_at = \"$TIMESTAMP\"
+          " -i configs/release-status.yaml
+
+          echo "Release validation approval recorded successfully for $RELEASE_VERSION"
+
+      - name: Update status to in_progress_community_release
+        run: |
+          RELEASE_VERSION="${{ steps.validate.outputs.release_version }}"
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          echo "Recording release validation completion and updating status..."
+
+          # Update status to in_progress_community_release after release validation
+          yq e "
+            .current_release.status = \"in_progress_community_release\" |
+            .current_release.community_release.triggered_at = \"$TIMESTAMP\"
+          " -i configs/release-status.yaml
+
+          echo "Release status updated to 'in_progress_community_release'"
+
+      - name: Trigger community release workflow
+        id: trigger-community
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          RELEASE_VERSION="${{ steps.validate.outputs.release_version }}"
+
+          echo "Triggering community release workflow for: $RELEASE_VERSION"
+          gh workflow run release-community.yaml \
+            --repo opendatahub-io/opendatahub-operator \
+            --field version="${RELEASE_VERSION#v}"
+
+          echo "Community release workflow triggered successfully"
+
+
+
+      - name: Update README with release status
+        if: always()
+        run: |
+          echo "Updating README with current release status..."
+          python3 .github/scripts/readme_manager.py --mode generate
+          echo "README updated successfully"
+
+      - name: Commit status changes
+        if: always()
+        uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+        with:
+          commit_message: |
+            release-validation: ${{ steps.validate.outputs.release_version }} by ${{ github.actor }}
+
+            Release validation provided and community release triggered for ${{ steps.validate.outputs.release_version }}.
+            Status: ${{ job.status }}
+
+            Co-Authored-By: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
+          file_pattern: "configs/release-status.yaml README.md"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+
+      - name: Summary
+        if: always()
+        run: |
+          RELEASE_VERSION="${{ steps.validate.outputs.release_version }}"
+          CURRENT_STATUS=$(yq e '.current_release.status // "null"' configs/release-status.yaml)
+          VALIDATOR=$(yq e '.current_release.release_validation.validated_by // "null"' configs/release-status.yaml)
+          VALIDATION_TIME=$(yq e '.current_release.release_validation.validated_at // "null"' configs/release-status.yaml)
+          COMMUNITY_TRIGGERED_AT=$(yq e '.current_release.community_release.triggered_at // "null"' configs/release-status.yaml)
+
+          echo "## Release Validation and Community Release Summary"
+          echo ""
+          echo "**Release Version:** $RELEASE_VERSION"
+          echo "**Release Validation:** $VALIDATOR at $VALIDATION_TIME"
+          echo "**Status:** $CURRENT_STATUS"
+          echo "**Community Release Triggered:** $COMMUNITY_TRIGGERED_AT"
+          echo ""
+          echo "✅ **Release Validation Successfully Recorded**"
+          echo "✅ **Community Release Process Initiated**"
+          echo ""
+          echo "## Next Steps - Manual Monitoring Required"
+          echo ""
+          echo "🔍 **Monitor Community Operators PR:**"
+          echo "   - Check the opendatahub-operator release workflow for community PR creation"
+          echo "   - Watch for community operators pull request to merge"
+          echo ""
+          echo "⚡ **When Community PR Merges:**"
+          echo "   - Run the 'Complete Release' workflow manually"
+          echo "   - This will mark the release as completed and move it to history"
+          echo ""
+          echo "⚠️  **If Community PR Issues Occur:**"
+          echo "   - Resolve any community PR problems"
+          echo "   - Release will remain in 'in_progress_community_release' status"
+          echo "   - Manual completion can be triggered once resolved"

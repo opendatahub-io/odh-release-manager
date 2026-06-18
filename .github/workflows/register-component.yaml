@@ -1,0 +1,162 @@
+name: Register Component
+on:
+  workflow_dispatch:
+    inputs:
+      component_name:
+        description: "Component name"
+        required: true
+        type: choice
+        options:
+          - dashboard
+          - notebook-controller
+          - workbenches/notebooks
+          - kserve
+          - ray
+          - trustyai
+          - modelregistry
+          - trainingoperator
+          - datasciencepipelines
+          - modelcontroller
+          - feastoperator
+          - ogx
+          - trainer
+          - maas
+          - mlflowoperator
+          - sparkoperator
+          - wva
+      release_version:
+        description: "Release version (leave empty to use current active release)"
+        required: false
+        type: string
+      component_tag:
+        description: "Component tag (e.g., v1.5.3) - leave empty for branch-based components"
+        required: false
+        type: string
+      branch_name:
+        description: "Branch name (e.g., release-v2.1) - required for all components"
+        required: true
+        type: string
+permissions:
+  contents: read  # Default permissions, elevated access via GitHub App token
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token for ODH_RELEASE_BOT
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ODH_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.ODH_RELEASE_BOT_PRIVATE_KEY }}
+          owner: opendatahub-io
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.generate-token.outputs.token }}  # Use GitHub App token
+      - name: Determine target release version
+        id: release-version
+        run: |
+          if [ -n "${{ inputs.release_version }}" ]; then
+            # User provided a specific release version
+            RELEASE_VERSION="${{ inputs.release_version }}"
+            echo "Using user-specified release: $RELEASE_VERSION"
+          else
+            # Use current active release
+            CURRENT_RELEASE=$(yq e '.current_release.version // null' configs/release-status.yaml)
+            if [ "$CURRENT_RELEASE" = "null" ] || [ -z "$CURRENT_RELEASE" ]; then
+              echo "::error::No active release found and no release version specified. Please provide a release version or start a release first."
+              exit 1
+            fi
+            RELEASE_VERSION="$CURRENT_RELEASE"
+            echo "Using current active release: $RELEASE_VERSION"
+          fi
+
+          echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Target release: $RELEASE_VERSION"
+      - name: Validate release version format
+        run: |
+          RELEASE_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+(-ea\.[0-9]+)?$'
+          RELEASE_VERSION="${{ steps.release-version.outputs.release_version }}"
+
+          if [[ ! "$RELEASE_VERSION" =~ $RELEASE_REGEX ]]; then
+            echo "::error::Invalid release version format: '$RELEASE_VERSION'. Expected format: v<major>.<minor>.<patch> or v<major>.<minor>.<patch>-ea.<number> (e.g., v3.4.0, v3.4.0-ea.2)"
+            exit 1
+          fi
+      - name: Detect component type
+        id: detect-type
+        run: |
+          COMPONENT="${{ inputs.component_name }}"
+          TYPE=$(yq e ".components[] | select(.name == \"$COMPONENT\") | .type // \"component\"" configs/components-registry.yaml)
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "Component '$COMPONENT' is of type '$TYPE'"
+      - name: Register component
+        run: |
+          RELEASE_VERSION="${{ steps.release-version.outputs.release_version }}"
+          RELEASE_DIR="releases/$RELEASE_VERSION"
+          COMPONENTS_FILE="${RELEASE_DIR}/components.yaml"
+          COMPONENT="${{ inputs.component_name }}"
+          COMPONENT_TAG="${{ inputs.component_tag }}"
+          BRANCH_NAME="${{ inputs.branch_name }}"
+          TYPE="${{ steps.detect-type.outputs.type }}"
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          # Validate branch_name is always provided
+          if [ -z "$BRANCH_NAME" ]; then
+            echo "::error::branch_name is required"
+            exit 1
+          fi
+
+          # Determine what to use for versioning
+          if [ -n "$COMPONENT_TAG" ]; then
+            # Tag-based: use tag for version, branch for context
+            VERSION="$COMPONENT_TAG"
+            echo "Using tag: $VERSION (from branch: $BRANCH_NAME)"
+          else
+            # Branch-based: use branch for version
+            VERSION="$BRANCH_NAME"
+            echo "Using branch: $VERSION"
+          fi
+
+          mkdir -p "$RELEASE_DIR"
+
+          if [ ! -f "$COMPONENTS_FILE" ]; then
+            yq -n '.components = []' > "$COMPONENTS_FILE"
+          fi
+
+          # Check if component already exists and update or append
+          EXISTING=$(yq e ".components[] | select(.name == \"$COMPONENT\") | .name" "$COMPONENTS_FILE")
+
+          if [ "$TYPE" = "image" ]; then
+            ENTRY="{\"name\": \"$COMPONENT\", \"version\": \"$VERSION\", \"type\": \"image\", \"registered_at\": \"$TIMESTAMP\"}"
+          else
+            ENTRY="{\"name\": \"$COMPONENT\", \"version\": \"$VERSION\", \"branch\": \"$BRANCH_NAME\", \"registered_at\": \"$TIMESTAMP\"}"
+          fi
+
+          if [ -n "$EXISTING" ]; then
+            # Remove existing entry and re-add with updated values
+            yq e "del(.components[] | select(.name == \"$COMPONENT\"))" -i "$COMPONENTS_FILE"
+            yq e ".components += [$ENTRY]" -i "$COMPONENTS_FILE"
+            echo "Updated '$COMPONENT' to version '$VERSION' for release '$RELEASE_VERSION'"
+          else
+            yq e ".components += [$ENTRY]" -i "$COMPONENTS_FILE"
+            echo "Registered '$COMPONENT' version '$VERSION' for release '$RELEASE_VERSION'"
+          fi
+
+          cat "$COMPONENTS_FILE"
+      - name: Update release README
+        run: |
+          python3 .github/scripts/readme_manager.py --mode release --version "${{ steps.release-version.outputs.release_version }}"
+      - name: Check release readiness
+        run: |
+          .github/scripts/check_release_readiness.sh "${{ steps.release-version.outputs.release_version }}"
+      - name: Commit and push
+        uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+        with:
+          commit_message: "register: ${{ inputs.component_name }} ${{ inputs.component_tag }} for ${{ steps.release-version.outputs.release_version }}"
+          file_pattern: "releases/${{ steps.release-version.outputs.release_version }}/components.yaml releases/${{ steps.release-version.outputs.release_version }}/README.md"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"

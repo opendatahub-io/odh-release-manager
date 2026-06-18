@@ -1,0 +1,171 @@
+name: Set Next Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Update mode"
+        required: true
+        type: choice
+        options:
+          - next_release_only
+          - current_release_only
+          - both
+      release_version:
+        description: "Next release version (e.g., v3.5.0-ea.2)"
+        required: false
+        type: string
+      release_date:
+        description: "Next release date (YYYY-MM-DD format, e.g., 2026-06-01)"
+        required: false
+        type: string
+      code_freeze_date:
+        description: "Code freeze date (optional - defaults to 3 days before release for Friday freeze)"
+        required: false
+        type: string
+      current_version:
+        description: "Current release version (for current_release_only or both modes)"
+        required: false
+        type: string
+      current_release_date:
+        description: "Current release date (for current_release_only or both modes)"
+        required: false
+        type: string
+      enabled:
+        description: "Show next release alert box in README"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read  # Default permissions, elevated access via GitHub App token
+
+jobs:
+  set-next-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token for ODH_RELEASE_BOT
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ODH_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.ODH_RELEASE_BOT_PRIVATE_KEY }}
+          owner: opendatahub-io
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.generate-token.outputs.token }}  # Use GitHub App token
+
+      - name: Validate inputs and calculate dates
+        id: dates
+        run: |
+          .github/scripts/validate_set_release_inputs.sh "${{ inputs.mode }}" "${{ inputs.release_version }}" "${{ inputs.release_date }}" "${{ inputs.current_version }}" "${{ inputs.current_release_date }}" "${{ inputs.code_freeze_date }}"
+
+      - name: Update current release information
+        if: inputs.mode == 'current_release_only' || inputs.mode == 'both'
+        run: |
+          MODE="${{ inputs.mode }}"
+          CURRENT_VERSION="${{ inputs.current_version }}"
+          CURRENT_RELEASE_DATE="${{ steps.dates.outputs.current_release_date }}"
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          ACTOR="${{ github.actor }}"
+
+          echo "Updating current release information:"
+          echo "  Version: $CURRENT_VERSION"
+          echo "  Release Date: $CURRENT_RELEASE_DATE"
+          echo "  Updated by: $ACTOR"
+
+          # Check if there's an existing current release to prevent overwriting
+          EXISTING_STATUS=$(yq e '.current_release.status // "null"' configs/release-status.yaml)
+          EXISTING_VERSION=$(yq e '.current_release.version // "null"' configs/release-status.yaml)
+
+          if [ "$EXISTING_STATUS" == "completed" ] && [ "$EXISTING_VERSION" != "null" ]; then
+            echo "WARNING: Existing completed release found ($EXISTING_VERSION). This will be overwritten."
+          fi
+
+          # Calculate code freeze deadline (3 days before release)
+          CODE_FREEZE_DEADLINE=$(date -d "$CURRENT_RELEASE_DATE - 3 days" +"%Y-%m-%dT23:59:59Z")
+
+          # Update current release section
+          yq e "
+            .current_release.version = \"$CURRENT_VERSION\" |
+            .current_release.release_date = \"$CURRENT_RELEASE_DATE\" |
+            .current_release.status = \"scheduled\" |
+            .current_release.code_freeze_deadline = \"$CODE_FREEZE_DEADLINE\" |
+            .current_release.triggered_at = null |
+            .current_release.triggered_by = null |
+            .current_release.completed_at = null |
+            .current_release.external_run_url = null
+          " -i configs/release-status.yaml
+
+          # Create release directory structure
+          RELEASE_DIR="releases/$CURRENT_VERSION"
+          if [ ! -d "$RELEASE_DIR" ]; then
+            mkdir -p "$RELEASE_DIR"
+            echo "components: []" > "$RELEASE_DIR/components.yaml"
+            echo "Created release directory: $RELEASE_DIR/"
+          else
+            echo "📂 Release directory already exists: $RELEASE_DIR/"
+          fi
+
+          # For bootstrap scenarios or current_release_only mode, disable next_release
+          if [ "$MODE" == "current_release_only" ]; then
+            yq e ".next_release.enabled = false" -i configs/release-status.yaml
+            echo "Disabled next_release section (current_release_only mode)"
+          fi
+
+          echo "Updated current release configuration"
+          echo "Current release:"
+          yq e '.current_release' configs/release-status.yaml
+
+      - name: Update next release information
+        if: inputs.mode == 'next_release_only' || inputs.mode == 'both'
+        run: |
+          RELEASE_VERSION="${{ inputs.release_version }}"
+          RELEASE_DATE="${{ steps.dates.outputs.release_date }}"
+          CODE_FREEZE_DATE="${{ steps.dates.outputs.code_freeze_date }}"
+          ENABLED="${{ inputs.enabled }}"
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          ACTOR="${{ github.actor }}"
+
+          echo "Updating next release information:"
+          echo "  Version: $RELEASE_VERSION"
+          echo "  Release Date: $RELEASE_DATE"
+          echo "  Code Freeze: $CODE_FREEZE_DATE"
+          echo "  Enabled: $ENABLED"
+          echo "  Updated by: $ACTOR"
+
+          # Update release-status.yaml next_release section
+          yq e "
+            .next_release.enabled = $ENABLED |
+            .next_release.version = \"$RELEASE_VERSION\" |
+            .next_release.release_date = \"$RELEASE_DATE\" |
+            .next_release.code_freeze_date = \"$CODE_FREEZE_DATE\" |
+            .next_release.last_updated = \"$TIMESTAMP\" |
+            .next_release.updated_by = \"$ACTOR\"
+          " -i configs/release-status.yaml
+
+          echo "Updated next release configuration"
+          echo "Next release:"
+          yq e '.next_release' configs/release-status.yaml
+
+      - name: Update README with next release information
+        run: |
+          # Use the unified README manager to regenerate README
+          python3 .github/scripts/readme_manager.py --mode generate
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+        with:
+          commit_message: |
+            set-next-release: ${{ inputs.mode }} mode
+            ${{ inputs.mode == 'current_release_only' && format('- current: {0} on {1}', inputs.current_version, steps.dates.outputs.current_release_date) || '' }}
+            ${{ inputs.mode == 'next_release_only' && format('- next: {0} on {1}', inputs.release_version, steps.dates.outputs.release_date) || '' }}
+            ${{ inputs.mode == 'both' && format('- current: {0} on {1} / next: {2} on {3}', inputs.current_version, steps.dates.outputs.current_release_date, inputs.release_version, steps.dates.outputs.release_date) || '' }}
+          file_pattern: "configs/release-status.yaml README.md releases/"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"

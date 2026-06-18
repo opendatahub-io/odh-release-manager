@@ -1,0 +1,113 @@
+name: Onboard Component
+
+on:
+  workflow_dispatch:
+    inputs:
+      component_name:
+        description: "Component name (kebab-case, e.g., my-component)"
+        required: true
+        type: string
+      display_name:
+        description: "Display name (e.g., My Component)"
+        required: true
+        type: string
+      component_type:
+        description: "Component type"
+        required: true
+        type: choice
+        options:
+          - component
+          - image
+
+permissions:
+  contents: read  # Default permissions, elevated access via GitHub App token
+
+jobs:
+  onboard-component:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token for ODH_RELEASE_BOT
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ODH_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.ODH_RELEASE_BOT_PRIVATE_KEY }}
+          owner: opendatahub-io
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.generate-token.outputs.token }}  # Use GitHub App token
+
+      - name: Validate component name
+        run: .github/scripts/validate-component-name.sh "${{ inputs.component_name }}"
+
+      - name: Validate display name
+        run: .github/scripts/validate-display-name.sh "${{ inputs.display_name }}"
+
+      - name: Add component to registry
+        run: |
+          COMPONENT="${{ inputs.component_name }}"
+          DISPLAY_NAME="${{ inputs.display_name }}"
+          TYPE="${{ inputs.component_type }}"
+
+          # Create new component entry
+          if [ "$TYPE" = "component" ]; then
+            NEW_ENTRY="{\"name\": \"$COMPONENT\", \"display_name\": \"$DISPLAY_NAME\"}"
+          else
+            NEW_ENTRY="{\"name\": \"$COMPONENT\", \"display_name\": \"$DISPLAY_NAME\", \"type\": \"$TYPE\"}"
+          fi
+
+          # Add to registry
+          yq e ".components += [$NEW_ENTRY]" -i configs/components-registry.yaml
+
+          echo "Added component '$COMPONENT' to registry:"
+          yq e ".components[] | select(.name == \"$COMPONENT\")" configs/components-registry.yaml
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+          commit-message: |
+            feat: add ${{ inputs.component_name }} component to registry
+
+            Component: ${{ inputs.component_name }}
+            Display Name: ${{ inputs.display_name }}
+            Type: ${{ inputs.component_type }}
+            Requested by: ${{ github.actor }}
+          branch: add-component-${{ inputs.component_name }}
+          delete-branch: true
+          title: "feat: add ${{ inputs.component_name }} component to registry"
+          body: |
+            ##  Add Component: `${{ inputs.component_name }}`
+
+            ### Component Details
+            | Field | Value |
+            |-------|-------|
+            | **Component Name** | `${{ inputs.component_name }}` |
+            | **Display Name** | ${{ inputs.display_name }} |
+            | **Type** | `${{ inputs.component_type }}` |
+            | **Requested by** | @${{ github.actor }} |
+
+            ### Review Checklist
+            - [ ] Component name follows kebab-case naming convention
+            - [ ] Display name is descriptive and user-friendly
+            - [ ] Component type is appropriate (component/image)
+            - [ ] No duplicate component names in registry
+
+            ---
+
+            > **Note:** Once this PR is approved and merged, the component will be available in the register-component workflow for all future releases.
+
+      - name: Output success message
+        run: |
+          echo "Component onboarding request submitted successfully!"
+          echo ""
+          echo "Component: ${{ inputs.component_name }}"
+          echo "Display Name: ${{ inputs.display_name }}"
+          echo "Type: ${{ inputs.component_type }}"
+          echo ""
+          echo "A pull request has been created for review. Release managers will review your request and provide feedback."
+          echo "Once approved and merged, your component will be available in the register-component workflow."
+          echo ""
+          echo "Thank you for contributing to ODH releases!"

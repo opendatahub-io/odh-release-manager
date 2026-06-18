@@ -1,0 +1,52 @@
+components:
+  - name: dashboard
+    display_name: OpenDataHub Dashboard
+    type: component
+  - name: workbenches/notebook-controller
+    display_name: Notebook Controller
+    type: component
+  - name: workbenches/notebooks
+    display_name: Notebooks
+    type: component
+  - name: kserve
+    display_name: KServe
+    type: component
+  - name: ray
+    display_name: Ray
+    type: component
+  - name: trustyai
+    display_name: TrustyAI
+    type: component
+  - name: modelregistry
+    display_name: Model Registry
+    type: component
+  - name: trainingoperator
+    display_name: Training Operator
+    type: component
+  - name: datasciencepipelines
+    display_name: Data Science Pipelines
+    type: component
+  - name: modelcontroller
+    display_name: ODH Model Controller
+    type: component
+  - name: feastoperator
+    display_name: Feast Operator
+    type: component
+  - name: ogx
+    display_name: OGX K8s Operator
+    type: component
+  - name: trainer
+    display_name: Trainer
+    type: component
+  - name: maas
+    display_name: Models as a Service
+    type: component
+  - name: mlflowoperator
+    display_name: MLFlow Operator
+    type: component
+  - name: sparkoperator
+    display_name: Spark Operator
+    type: component
+  - name: wva
+    display_name: Workload Variant Autoscaler
+    type: component

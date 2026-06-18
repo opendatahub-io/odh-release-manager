@@ -1,0 +1,183 @@
+name: Complete Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version"
+        required: true
+        type: string
+
+permissions:
+  contents: read  # Default permissions, elevated access via GitHub App token
+
+jobs:
+  complete-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token for ODH_RELEASE_BOT
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ODH_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.ODH_RELEASE_BOT_PRIVATE_KEY }}
+          owner: opendatahub-io
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.generate-token.outputs.token }}  # Use GitHub App token
+
+      - name: Validate release version format
+        run: |
+          RELEASE_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+(-ea\.[0-9]+)?$'
+          if [[ ! "${{ inputs.release_version }}" =~ $RELEASE_REGEX ]]; then
+            echo "::error::Invalid release version format: '${{ inputs.release_version }}'"
+            exit 1
+          fi
+
+      - name: Complete release
+        run: |
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          if [ ! -f "configs/release-status.yaml" ]; then
+            echo "::error::Release status file not found"
+            exit 1
+          fi
+
+          CURRENT_VERSION=$(yq e '.current_release.version // "null"' configs/release-status.yaml)
+          if [ "$CURRENT_VERSION" != "${{ inputs.release_version }}" ]; then
+            echo "::error::Current release ($CURRENT_VERSION) does not match input (${{ inputs.release_version }})"
+            exit 1
+          fi
+
+          # Update current release status
+          yq e "
+            .current_release.status = \"completed\" |
+            .current_release.completed_at = \"$TIMESTAMP\"
+          " -i configs/release-status.yaml
+
+
+          echo "Completed release ${{ inputs.release_version }}"
+
+      - name: Store component data for future fallback
+        run: |
+          RELEASE_DIR="releases/${{ inputs.release_version }}"
+          COMPONENTS_FILE="$RELEASE_DIR/components.yaml"
+
+          if [ ! -f "$COMPONENTS_FILE" ]; then
+            echo "::error::Components file not found: $COMPONENTS_FILE"
+            exit 1
+          fi
+
+          # Build enhanced component mapping for storage in history
+          echo "Building enhanced component mapping for history storage..."
+
+          COMPONENT_MAP="{}"
+
+          while IFS= read -r component_line; do
+            # Parse component data from registry
+            COMP_NAME=$(echo "$component_line" | yq e '.name' -)
+            COMP_DISPLAY_NAME=$(echo "$component_line" | yq e '.display_name' -)
+
+            # Get version from components file
+            COMP_VERSION=$(yq e ".components[] | select(.name == \"$COMP_NAME\") | .version" "$COMPONENTS_FILE" 2>/dev/null || echo "")
+
+            if [ -n "$COMP_NAME" ] && [ -n "$COMP_VERSION" ] && [ -n "$COMP_DISPLAY_NAME" ]; then
+              COMPONENT_MAP=$(echo "$COMPONENT_MAP" | jq --arg comp "$COMP_NAME" --arg version "$COMP_VERSION" --arg display "$COMP_DISPLAY_NAME" \
+                '. + {($comp): {"ref": $version, "display_name": $display}}')
+            fi
+          done < <(yq e '.components[] | select(.type == "component")' configs/components-registry.yaml -o=json | jq -c '.')
+
+          # Store enhanced component mapping in current release for history
+          yq e ".current_release.components = $COMPONENT_MAP" -i configs/release-status.yaml
+
+          echo "Stored component data for future fallback"
+          echo "Component mapping:"
+          echo "$COMPONENT_MAP" | jq '.'
+
+      - name: Move completed release to history
+        run: |
+          # Add current release to history
+          yq e '.release_history = [.current_release] + .release_history' -i configs/release-status.yaml
+
+          # Keep only last 10 releases in history
+          yq e '.release_history = .release_history[0:10]' -i configs/release-status.yaml
+
+          # Clear current release
+          yq e '.current_release = null' -i configs/release-status.yaml
+
+          echo "Moved release to history and cleared current release"
+
+      - name: Promote next release to current (if available)
+        run: |
+          NEXT_VERSION=$(yq e '.next_release.version // "null"' configs/release-status.yaml)
+          NEXT_DATE=$(yq e '.next_release.release_date // ""' configs/release-status.yaml)
+          CODE_FREEZE=$(yq e '.next_release.code_freeze_date // ""' configs/release-status.yaml)
+
+          if [ "$NEXT_VERSION" != "null" ] && [ -n "$NEXT_VERSION" ]; then
+            echo "Promoting $NEXT_VERSION from next_release to current_release"
+
+            # Promote to current with scheduled status
+            yq e "
+              .current_release.version = \"$NEXT_VERSION\" |
+              .current_release.release_date = \"$NEXT_DATE\" |
+              .current_release.status = \"scheduled\" |
+              .current_release.code_freeze_deadline = \"$CODE_FREEZE\" |
+              .current_release.triggered_at = null |
+              .current_release.triggered_by = null |
+              .current_release.completed_at = null |
+              .current_release.external_run_url = null |
+              .current_release.error_message = null
+            " -i configs/release-status.yaml
+
+            # Clear next_release - will be set manually using set-next-release workflow
+            yq e "
+              .next_release.enabled = false |
+              .next_release.version = null |
+              .next_release.release_date = null |
+              .next_release.code_freeze_date = null |
+              .next_release.last_updated = null |
+              .next_release.updated_by = null
+            " -i configs/release-status.yaml
+
+            # Create release directory structure
+            mkdir -p "releases/$NEXT_VERSION"
+            echo "components: []" > "releases/$NEXT_VERSION/components.yaml"
+
+            echo "Created releases/$NEXT_VERSION/ for component registration"
+            echo "Next release cleared - use 'Set Next Release' workflow to configure the next release"
+          else
+            echo "No next_release found - manual setup required"
+          fi
+
+      - name: Release status update
+        run: |
+          CURRENT_VERSION=$(yq e '.current_release.version // "null"' configs/release-status.yaml)
+          CURRENT_STATUS=$(yq e '.current_release.status // "null"' configs/release-status.yaml)
+
+          echo "Current version: $CURRENT_VERSION"
+          echo "Current status: $CURRENT_STATUS"
+
+          if [ "$CURRENT_VERSION" != "null" ] && [ "$CURRENT_STATUS" = "scheduled" ]; then
+            echo "New release $CURRENT_VERSION is scheduled and ready for component registration"
+          elif [ "$CURRENT_STATUS" = "awaiting_validation" ]; then
+            echo "Release $CURRENT_VERSION is awaiting validation - validators can run the validation workflow"
+          else
+            echo "Release status: $CURRENT_STATUS"
+          fi
+
+      - name: Regenerate root README
+        run: |
+          python3 .github/scripts/readme_manager.py --mode generate
+
+      - name: Commit and push
+        uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+        with:
+          commit_message: "release: complete release ${{ inputs.release_version }}"
+          file_pattern: "configs/release-status.yaml README.md"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"

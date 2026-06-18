@@ -1,0 +1,241 @@
+name: Trigger Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version (e.g., v3.4.0-ea.2)"
+        required: true
+        type: string
+      force_retrigger:
+        description: "Force retrigger even if release already exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read  # Default permissions, elevated access via GitHub App token
+
+jobs:
+  trigger-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token for ODH_RELEASE_BOT
+        id: generate-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.ODH_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.ODH_RELEASE_BOT_PRIVATE_KEY }}
+          owner: opendatahub-io
+          repositories: >-
+            odh-release-manager,
+            opendatahub-operator
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.generate-token.outputs.token }}  # Use GitHub App token
+
+      - name: Validate release version format
+        run: |
+          RELEASE_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+(-ea\.[0-9]+)?$'
+          if [[ ! "${{ inputs.release_version }}" =~ $RELEASE_REGEX ]]; then
+            echo "::error::Invalid release version format: '${{ inputs.release_version }}'"
+            echo "::error::Expected format: v<major>.<minor>.<patch> or v<major>.<minor>.<patch>-ea.<number>"
+            echo "::error::Examples: v3.4.0, v3.5.0-ea.2"
+            exit 1
+          fi
+          echo "Release version format is valid: ${{ inputs.release_version }}"
+
+      - name: Check if release already triggered (idempotency)
+        id: check-status
+        run: |
+          echo "Checking current release status for idempotency..."
+
+          # Check force retrigger flag first
+          if [ "${{ inputs.force_retrigger }}" = "true" ]; then
+            echo "already_triggered=false" >> "$GITHUB_OUTPUT"
+            echo "🔄 Force retrigger enabled - skipping idempotency checks"
+            echo "::warning::Force retrigger enabled - proceeding regardless of current status"
+            exit 0
+          fi
+
+          # Get current release info
+          CURRENT_STATUS=$(yq e '.current_release.status // "null"' configs/release-status.yaml)
+          CURRENT_VERSION=$(yq e '.current_release.version // "null"' configs/release-status.yaml)
+
+          echo "Current release version: $CURRENT_VERSION"
+          echo "Current release status: $CURRENT_STATUS"
+          echo "Requested release version: ${{ inputs.release_version }}"
+
+          # Check if we're trying to trigger the same release version
+          if [ "$CURRENT_VERSION" = "${{ inputs.release_version }}" ]; then
+            case "$CURRENT_STATUS" in
+              "completed")
+                echo "already_triggered=true" >> "$GITHUB_OUTPUT"
+                echo "::warning::Release ${{ inputs.release_version }} is already completed"
+                echo "::warning::Skipping trigger to maintain idempotency (use force retrigger to override)"
+                ;;
+              "awaiting_validation"|"failed")
+                echo "already_triggered=false" >> "$GITHUB_OUTPUT"
+                echo "Release ${{ inputs.release_version }} in status '$CURRENT_STATUS', allowing retrigger"
+                ;;
+              *)
+                echo "already_triggered=false" >> "$GITHUB_OUTPUT"
+                echo "Release ${{ inputs.release_version }} ready for trigger (status: $CURRENT_STATUS)"
+                ;;
+            esac
+          else
+            echo "already_triggered=false" >> "$GITHUB_OUTPUT"
+            if [ "$CURRENT_STATUS" != "null" ] && [ "$CURRENT_STATUS" != "completed" ]; then
+              echo "::warning::Current release $CURRENT_VERSION is $CURRENT_STATUS"
+              echo "::warning::Proceeding with new release ${{ inputs.release_version }}"
+            fi
+          fi
+
+      - name: Build component mapping with fallback
+        id: component-mapping
+        if: steps.check-status.outputs.already_triggered != 'true'
+        run: |
+          echo "Building component mapping for release: ${{ inputs.release_version }}"
+
+          # Run component mapping script
+          ./.github/scripts/build_component_mapping.sh "${{ inputs.release_version }}"
+
+          # Verify component mapping was generated
+          if [ ! -f "$GITHUB_OUTPUT" ] || ! grep -q "mapping<<EOF" "$GITHUB_OUTPUT"; then
+            echo "::error::Component mapping generation failed"
+            exit 1
+          fi
+
+          echo "Component mapping generated successfully"
+
+      - name: Prepare version (strip v prefix)
+        id: prepare-version
+        if: steps.check-status.outputs.already_triggered != 'true'
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          echo "Input release_version: $RELEASE_VERSION"
+          STRIPPED_VERSION=${RELEASE_VERSION#v}
+          echo "Stripped version: $STRIPPED_VERSION"
+          echo "version_no_prefix=$STRIPPED_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch to external repository
+        id: trigger-external
+        if: steps.check-status.outputs.already_triggered != 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+          repository: opendatahub-io/opendatahub-operator
+          event-type: release-staging-trigger
+          client-payload: |
+            {
+              "version": "${{ steps.prepare-version.outputs.version_no_prefix }}",
+              "component_data": ${{ steps.component-mapping.outputs.mapping }}
+            }
+
+      - name: Update release status to awaiting_validation
+        if: steps.check-status.outputs.already_triggered != 'true'
+        run: |
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          ACTOR="${{ github.actor }}"
+          EXTERNAL_URL="${{ steps.trigger-external.outputs.external_url }}"
+
+          echo "Updating release status to 'awaiting_validation'..."
+
+          # Initialize release and set status to awaiting_validation - staging complete, ready for validation
+          yq e "
+            .current_release.version = \"${{ inputs.release_version }}\" |
+            .current_release.status = \"awaiting_validation\" |
+            .current_release.created_at = \"$TIMESTAMP\" |
+            .current_release.created_by = \"$ACTOR\" |
+            .current_release.external_run_url = \"$EXTERNAL_URL\" |
+            .current_release.error_message = null |
+            .current_release.completed_at = null |
+            .current_release.release_validation.validated_by = null |
+            .current_release.release_validation.validated_at = null |
+            .current_release.community_release.triggered_at = null |
+            .current_release.community_release.pr_url = null |
+            .current_release.community_release.pr_merged = false
+          " -i configs/release-status.yaml
+
+          echo "Release status updated to awaiting_validation - ready for validation approval"
+
+      - name: Release validation ready
+        if: steps.check-status.outputs.already_triggered != 'true'
+        run: |
+          RELEASE_VERSION="${{ inputs.release_version }}"
+          echo "Release $RELEASE_VERSION is ready for validation"
+          echo "Validators can now run the 'Release Validation and Community Release' workflow to complete the release"
+
+      - name: Update README with release status
+        if: steps.check-status.outputs.already_triggered != 'true'
+        run: |
+          echo "Updating README with current release status..."
+
+          # Use existing README manager to regenerate
+          python3 .github/scripts/readme_manager.py --mode generate
+
+          echo "README updated successfully"
+
+      - name: Handle trigger failure
+        if: failure() && steps.check-status.outputs.already_triggered != 'true'
+        run: |
+          TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          ERROR_MSG="Trigger workflow failed during execution"
+
+          echo "Handling trigger failure..."
+
+          # Update status to failed
+          yq e "
+            .current_release.status = \"failed\" |
+            .current_release.error_message = \"$ERROR_MSG\" |
+            .current_release.completed_at = \"$TIMESTAMP\"
+          " -i configs/release-status.yaml
+
+          echo "Release status updated to failed"
+
+      - name: Commit and push changes
+        if: steps.check-status.outputs.already_triggered != 'true'
+        uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
+        env:
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+        with:
+          commit_message: |
+            trigger-release: ${{ inputs.release_version }}
+
+            Triggered external release workflow for ${{ inputs.release_version }}
+            Status: ${{ job.status }}
+
+            Co-Authored-By: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+          file_pattern: "configs/release-status.yaml README.md"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check-status.outputs.already_triggered }}" = "true" ]; then
+            echo "## Release Trigger Skipped"
+            echo ""
+            echo "Release ${{ inputs.release_version }} was already triggered or completed."
+            echo "This workflow run was skipped to maintain idempotency."
+            echo ""
+            echo "If you need to retry a failed release, ensure the status is 'failed' first."
+          else
+            echo "## Release Trigger Completed"
+            echo ""
+            echo "Successfully triggered release ${{ inputs.release_version }}"
+            echo ""
+            echo "**Next Steps:**"
+            echo "- Monitor external workflow at: ${{ steps.trigger-external.outputs.external_url }}"
+            echo "- Check release status in configs/release-status.yaml"
+            echo "- Use Release Validation workflow when external build finishes and is ready for validation approval"
+            echo ""
+            echo "**Component Data Sent:**"
+            echo '```json'
+            echo "Component mapping was sent to external workflow"
+            echo "(See component mapping details in the build step output above)"
+            echo '```'
+          fi
